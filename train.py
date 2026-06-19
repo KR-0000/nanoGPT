@@ -16,6 +16,45 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+# ============================================================
+# NOTES (AIM project, nanoGPT training infrastructure)
+# ============================================================
+# This file is NOT the model architecture, that lives in model.py
+# (GPTConfig and GPT). This is the surrounding training pipeline: load
+# data, build the model, run the train/eval loop, save checkpoints.
+# For the PI's "Lego pieces" framework, this is the harness the
+# architecture sits inside, useful context but not itself a block in
+# the model's data flow diagram.
+#
+# New concepts that show up in this file, explained once here:
+#
+# DDP (Distributed Data Parallel): a way to train across multiple GPUs
+# (or multiple machines) at once. Each GPU holds a full copy of the
+# model and processes a different slice of data, then the GPUs sync up
+# their gradients before each weight update. Not needed for a single
+# GPU laptop setup, this script auto detects whether it is being run
+# that way.
+#
+# Gradient accumulation: simulates a larger batch size than what
+# actually fits in GPU memory at once. Instead of updating the weights
+# after every batch, the script runs several smaller "micro batches",
+# adds up (accumulates) their gradients, and only then updates the
+# weights once. Net effect is the same as one big batch, but without
+# needing the memory for one big batch.
+#
+# Mixed precision (bfloat16 / float16): normally numbers are stored as
+# 32 bit floats. Mixed precision uses 16 bit floats for most of the
+# math instead, which is faster and uses less memory on modern GPUs,
+# while keeping the parts of training that need more precision (like
+# gradient accumulation) in 32 bit. GradScaler below exists only to
+# keep float16 training numerically stable, bfloat16 does not need it.
+#
+# Learning rate schedule: instead of using one fixed learning rate for
+# the whole training run, the rate is increased gradually at the start
+# (warmup) and then slowly decreased over time (decay). This tends to
+# train more reliably than a single fixed value.
+# ============================================================
+
 import os
 import time
 import math
@@ -79,6 +118,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
+# checks an environment variable that torchrun sets automatically to
+# decide whether this is a multi GPU (DDP) run or a single GPU run.
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
@@ -109,9 +150,18 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+# ctx is the mixed precision context manager. Code run inside "with ctx:"
+# further down (the forward pass) automatically uses the lower precision
+# dtype chosen above instead of the usual float32, when running on a GPU.
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
+# This is the data pipeline block: reads pre tokenized data straight off
+# disk as a memory mapped array (np.memmap), so the whole dataset does
+# not need to fit in RAM at once. ix picks random starting points, x is
+# the input chunk, y is that same chunk shifted over by one token, this
+# is the next token prediction target, matching the GPT.forward(idx,
+# targets) signature in model.py.
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -144,6 +194,13 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
+# Three ways to get a model, controlled by init_from above:
+#   'scratch' : build a brand new GPT with randomly initialized weights
+#   'resume'  : reload a checkpoint saved earlier by this same script,
+#               picks up training where it left off
+#   'gpt2*'   : load real pretrained GPT-2 weights via GPT.from_pretrained
+#               in model.py, then continue training (fine-tuning) from
+#               there instead of from scratch
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
@@ -193,6 +250,12 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
+# GradScaler exists only for float16 mixed precision training. float16
+# has a small numeric range, so gradients can sometimes underflow to
+# zero during backpropagation. The scaler temporarily multiplies the
+# loss up before backward(), then scales the gradients back down before
+# the optimizer step, avoiding that underflow. If using bfloat16 or
+# float32 instead, this is a no-op and does nothing.
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
@@ -202,12 +265,19 @@ if init_from == 'resume':
 checkpoint = None # free up memory
 
 # compile the model
+# torch.compile (PyTorch 2.0+) analyzes the model and generates faster
+# GPU code for it before training starts. Same model, same math, just
+# compiled ahead of time instead of run step by step in plain Python.
+# Takes about a minute up front in exchange for faster training after.
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
 # wrap model into DDP container
+# only runs in a multi GPU setup (see the DDP note near the top of this
+# file). Wrapping the model this way is what makes it automatically
+# sync gradients across all the GPUs after each backward pass.
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
@@ -228,6 +298,14 @@ def estimate_loss():
     return out
 
 # learning rate decay scheduler (cosine with warmup)
+# Three phases, controlled by the current step number (it):
+#   1. warmup:  rate climbs linearly from near 0 up to learning_rate
+#   2. decay:   rate eases back down following a cosine curve
+#   3. after lr_decay_iters: rate stays flat at the minimum, min_lr
+# Warmup avoids destabilizing the model with a big learning rate before
+# it has adjusted at all. The decay afterward lets training take large
+# steps early on and smaller, more careful steps as it gets closer to
+# convergence.
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_iters:
@@ -247,6 +325,15 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
+# Overview of what happens every iteration of the while loop below:
+#   1. set the learning rate for this step (from get_lr above)
+#   2. occasionally: measure train/val loss, save a checkpoint to disk
+#   3. run forward + backward passes (possibly several micro batches,
+#      see gradient accumulation note near the top of this file)
+#   4. clip gradients (caps how large a single update can be, prevents
+#      one bad batch from throwing training off course)
+#   5. update the weights (optimizer.step), then clear gradients
+#   6. log timing and loss, repeat until max_iters is reached
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process

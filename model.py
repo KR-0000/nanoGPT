@@ -7,6 +7,33 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+# ============================================================
+# NOTES (nanoGPT deconstruction, decoder architecture)
+# ============================================================
+# This is the real nanoGPT model.py from karpathy/nanoGPT, not the
+# ng-video-lecture repo. The lecture repo is missing a weight init fix
+# (see GPT.__init__ below), so I am using this repo as the guide.
+#
+# Top to bottom this file builds, in order:
+#   LayerNorm             normalizes activations, used inside each block
+#   CausalSelfAttention   the "communication" step between tokens
+#   MLP                   the "computation" step applied per token
+#   Block                 one transformer layer (attention + MLP)
+#   GPTConfig             hyperparameters that define model size
+#   GPT                   stacks n_layer Blocks into the full model
+#
+# Data flow through the whole model (also see forward() near the bottom):
+#   token ids -> token embedding + position embedding -> N x Block ->
+#   final LayerNorm -> linear projection to vocabulary -> logits
+#
+# This is a DECODER only architecture, like GPT. It only looks at past
+# tokens, never future ones (see the causal mask in CausalSelfAttention).
+# Encoder models like BioBERT reuse the same building blocks (LayerNorm,
+# attention, MLP, residual connections) but drop the causal mask, since
+# they are allowed to look at the whole sequence at once instead of just
+# the past.
+# ============================================================
+
 import math
 import inspect
 from dataclasses import dataclass
@@ -15,6 +42,16 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# --- BLOCK: LayerNorm -----------------------------------------------------
+# What it does: takes a vector and rescales it so its values have mean 0
+# and a standard deviation of 1, then applies a learned scale and shift.
+# Why: keeps the numbers flowing through the network in a stable range as
+# they pass through many layers, which makes training more reliable.
+# Applied per token, independently, not across the whole batch.
+# Input shape: (..., ndim). Output shape: same as input.
+# Difference from PyTorch's built in nn.LayerNorm: this version lets you
+# turn the bias term off (bias=False), which newer models do for a small
+# speed and stability gain. nn.LayerNorm always includes a bias.
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -26,22 +63,56 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+# --- BLOCK: CausalSelfAttention ---------------------------------------------
+# This is the core "communication" mechanism of a transformer: each token
+# looks back at earlier tokens and pulls in the information it needs.
+#
+# Quick concept refresher (Query, Key, Value):
+#   Query (Q): what this token is looking for
+#   Key (K):   what each token (including past ones) has to offer
+#   Value (V): the actual information passed along if selected
+# A token compares its Query against every past token's Key to decide how
+# much attention to pay to it, then takes a weighted average of the Values.
+#
+# "Causal" means a token can only attend to itself and earlier tokens, never
+# later ones. This is enforced with a mask (see is_causal=True / self.bias
+# below). This is what makes the model a decoder, suited for generating
+# text left to right. An encoder model would skip this mask and let every
+# token see the full sequence in both directions.
+#
+# Input shape: (B, T, C) = (batch size, sequence length, embedding dim)
+# Output shape: (B, T, C), unchanged, ready to be added back via a residual
+# connection in Block below.
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
+        # one big Linear layer computes Q, K, and V together (3x the width),
+        # then forward() below splits it back into three pieces. This is
+        # faster on a GPU than three separate small Linear layers.
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
+        # after the multiple attention heads are combined back together,
+        # this layer mixes that combined result back into one vector per
+        # token of width n_embd.
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
+        # dropout randomly zeroes out some values during training only.
+        # it forces the network to not rely too heavily on any single
+        # connection, which helps it generalize instead of memorizing.
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        # Flash Attention is a fused, memory efficient way to compute the
+        # same attention math below in one optimized GPU operation. If the
+        # PyTorch version is too old, it falls back to the manual version
+        # in the else branch of forward(), which computes the exact same
+        # result just slower and using more memory.
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -54,6 +125,9 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # reshape so each of the n_head attention heads gets its own slice
+        # of the embedding, and all heads can be computed in parallel
+        # instead of looping over them one at a time.
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -61,13 +135,23 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
+            # is_causal=True applies the same "don't look at future tokens"
+            # rule as the manual mask below, just inside the fused kernel.
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # step 1: compare every Query against every Key (dot product),
+            # scaled down so the numbers do not get too large for softmax.
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # step 2: block out future positions so a token cannot see
+            # what comes after it (the "causal" part of causal attention).
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # step 3: turn the scores into a probability distribution that
+            # sums to 1 across each row.
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
+            # step 4: take the weighted average of Values using those
+            # probabilities as weights.
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -75,6 +159,20 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# --- BLOCK: MLP (the "computation" step) ------------------------------------
+# Where CausalSelfAttention lets tokens share information with each other,
+# the MLP processes each token on its own, with no mixing across positions.
+# Think of attention as "gather context" and MLP as "think about it".
+#
+# Shape of the computation: n_embd -> 4 * n_embd -> n_embd. It expands each
+# token's vector to 4x the width, applies a nonlinearity (GELU), then
+# projects back down. The 4x expansion is a standard choice carried over
+# from the original transformer paper and used in GPT-2 and BERT alike.
+#
+# GELU is an activation function, similar in spirit to ReLU (which just
+# zeroes out negative numbers) but smoother. GPT-2 and BERT both use GELU.
+#
+# Input shape: (B, T, C). Output shape: (B, T, C), unchanged.
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -91,6 +189,23 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+# --- BLOCK: Block (one full transformer layer) ------------------------------
+# Combines CausalSelfAttention and MLP into one repeatable layer. GPT
+# stacks n_layer copies of this Block to build the full model (see GPT
+# class below). Two ideas worth knowing here:
+#
+# Residual connection (the "x +" parts in forward below): the input to a
+# sub-block is added back to that sub-block's output. This means the
+# sub-block only has to learn what to CHANGE about x, not rebuild it from
+# nothing. Without this, very deep stacks of layers become hard to train
+# because gradients shrink or explode as they pass through many layers.
+#
+# Pre-norm: LayerNorm is applied BEFORE attention and before the MLP, not
+# after. This ordering (used by GPT-2 and this repo) trains more stably
+# than the original transformer paper's design, which normalized after.
+#
+# Input and output shape are both (B, T, C), which is what makes Block
+# stackable: the output of one Block can be fed straight into the next.
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -105,6 +220,17 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+# --- CONFIG: GPTConfig -------------------------------------------------------
+# Not a model component itself, this is the spec sheet that every block
+# above reads from. Changing these numbers changes the size and behavior
+# of the model without touching any of the architecture code.
+#   block_size  context window: how many past tokens the model can see
+#   vocab_size  how many unique tokens the tokenizer can produce
+#   n_layer     how many Blocks are stacked (depth)
+#   n_head      how many parallel attention heads per Block
+#   n_embd      width of the vector representing each token
+# The default values below (n_layer=12, n_head=12, n_embd=768) match the
+# smallest GPT-2 size, about 124 million parameters.
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -115,6 +241,19 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+# --- BLOCK: GPT (full model assembly) ----------------------------------------
+# This class wires every piece above together into the complete model.
+# self.transformer is a container holding, in order:
+#   wte    token embedding table, turns a token id into a dense vector
+#   wpe    position embedding table, turns a position (0, 1, 2, ...) into
+#          a dense vector. Needed because attention has no built in sense
+#          of word order, this is what tells the model which token came
+#          first, second, and so on.
+#   drop   dropout applied once right after combining the two embeddings
+#   h      the stack of n_layer Block objects
+#   ln_f   one final LayerNorm applied after all the Blocks
+# lm_head then projects the final vector for each token up to a score
+# (logit) for every possible next token in the vocabulary.
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -135,11 +274,28 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        # Weight tying: the token embedding table (wte) and the output
+        # layer (lm_head) are set to literally share the same weight
+        # matrix. Embedding maps token id to vector, lm_head maps vector
+        # back to a score per token id, the two jobs are mirror images of
+        # each other, so sharing one set of weights for both saves a large
+        # number of parameters (tens of millions, for GPT-2 sized models)
+        # and tends to improve quality slightly too.
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
+        # gives every weight a small random starting value (instead of 0
+        # or something huge) so training starts from a stable point.
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
+        # this is the fix that the ng-video-lecture mentioned as missing
+        # from that lecture's repo. Without it, training is noticeably
+        # slower to converge, especially as n_layer grows. The reasoning:
+        # every Block adds its output back onto x through the residual
+        # connection, so as more Blocks are stacked the values flowing
+        # through x would otherwise keep growing. Shrinking the output
+        # projection weights (c_proj) of each Block by 1/sqrt(2*n_layer)
+        # keeps that growth in check regardless of how deep the model is.
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
@@ -174,6 +330,9 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
+        # this is the full data flow described at the top of the file:
+        # token id -> embedding, position -> embedding, add them together,
+        # pass through every Block in order, then a final LayerNorm.
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
@@ -183,10 +342,20 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # this branch runs during training: compute a score (logit)
+            # for every position and every possible next token, then
+            # compare against the actual next tokens (targets) using
+            # cross entropy loss. Cross entropy measures how far the
+            # model's predicted probabilities are from the correct answer,
+            # lower is better. Training adjusts the weights to push this
+            # loss down over time.
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            # this branch runs during generation: we only care about
+            # predicting the next token, so there is no need to compute
+            # logits for every earlier position, just the last one.
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
@@ -196,6 +365,9 @@ class GPT(nn.Module):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
+        # NOTE: utility method, not part of the core architecture. Lets you
+        # shrink the context window after the model is already built, by
+        # trimming the position embedding table and the attention masks.
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
@@ -205,6 +377,17 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
+        # NOTE: utility method, not part of the core architecture. Loads
+        # real, already trained GPT-2 weights from HuggingFace into this
+        # model class, instead of starting from random weights. The
+        # transpose handling below exists because OpenAI's original GPT-2
+        # code stored weights in a slightly different layout (Conv1D)
+        # than the standard nn.Linear layout used in this file.
+        #
+        # This is the same general pattern used to load a pretrained
+        # biomedical model like BioBERT: take published weights and load
+        # them into a matching architecture, then optionally continue
+        # training (fine-tune) on a new dataset.
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
@@ -261,6 +444,17 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # NOTE: training infrastructure, not part of the architecture
+        # itself, but worth understanding since train.py calls this.
+        #
+        # Weight decay is a regularization technique: it nudges weights
+        # toward zero a little on every update, which helps prevent the
+        # model from overfitting (memorizing training data instead of
+        # learning general patterns). It should only be applied to the
+        # actual weight matrices (2D tensors), not to biases or LayerNorm
+        # parameters (1D tensors), since shrinking those does not help
+        # and can hurt. The split below sorts parameters into those two
+        # groups before handing them to the AdamW optimizer.
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -288,6 +482,12 @@ class GPT(nn.Module):
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # NOTE: benchmarking utility, not architecture. MFU is a measure
+        # of how much of the GPU's theoretical max speed is actually
+        # being used during training. Not something to spend much time
+        # on for the Phase 1 block diagram, useful later when actually
+        # training a model and checking if the hardware is being used
+        # efficiently.
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -309,6 +509,19 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        # This is autoregressive generation: predict one token, append it
+        # to the sequence, then predict the next one using that extended
+        # sequence, repeat. This loop is what makes a decoder model able
+        # to write text. An encoder model like BioBERT has no equivalent
+        # method, it produces a fixed size output (e.g. a classification)
+        # in a single forward pass instead of generating step by step.
+        #
+        # temperature controls how random the output is. Values below 1.0
+        # make the model more confident and repetitive, values above 1.0
+        # make it more random and varied.
+        # top_k, if set, restricts sampling to only the k highest scoring
+        # next tokens at each step, which avoids occasionally picking a
+        # very unlikely, nonsensical token.
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
